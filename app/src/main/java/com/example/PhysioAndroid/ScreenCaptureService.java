@@ -34,6 +34,7 @@ import android.widget.TextView;
 import androidx.core.util.Pair;
 
 import com.example.physioandroid.R;
+import com.google.android.gms.nearby.messages.MessageListener;
 
 import org.json.JSONObject;
 
@@ -47,6 +48,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.InetAddress;
+import java.net.MalformedURLException;
 import java.net.Socket;
 import java.net.URL;
 import java.nio.ByteBuffer;
@@ -55,6 +57,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 
 public class ScreenCaptureService extends Service {
@@ -62,7 +66,7 @@ public class ScreenCaptureService extends Service {
     public static String chosenProbe;
     public static String orientation;
     private String[] poses;
-    public Queue<byte[]> poseImagesToSend = new ConcurrentLinkedQueue<>();
+    public List<byte[]> poseImagesToSend = new ArrayList<>();
     public  List<Long> timeList = new ArrayList<>();
     public List<Float> pitchList = new ArrayList<>();
     public List<JSONObject> poseJSONsToSend = new ArrayList<>();
@@ -77,7 +81,9 @@ public class ScreenCaptureService extends Service {
     private static final String START = "START";
     private static final String STOP = "STOP";
     private static final String SCREENCAP_NAME = "screencap";
-
+    private ExecutorService mExecutor = Executors.newSingleThreadExecutor();
+    private static final int BUFFER_SIZE = 1920 * 1080 * 4; // Adjust based on your max resolution and pixel format
+    private final ByteBuffer mReusableBuffer = ByteBuffer.allocate(BUFFER_SIZE);
 
     private static int IMAGES_PRODUCED;
 
@@ -114,8 +120,25 @@ public class ScreenCaptureService extends Service {
 
     public static boolean closeApp = false;
     private String pt_number = "000000";
+    private long endTime;
+    private long lastImage;
+    private long acquriedImage;
+    private String message = "";
+    private MessageListener messageListener;
+    public interface MessageListener {
+        void onMessageChanged(String newMessage);
+    }
 
-
+    public void setMessageListener(MessageListener listener) {
+        this.messageListener = listener;
+    }
+    private void setMessage(String newMessage) {
+        this.message = newMessage;
+        if (messageListener != null) {
+            messageListener.onMessageChanged(newMessage);
+        }
+        updateUIText(newMessage);
+    }
     public static Intent getStartIntent(Context context, int resultCode, Intent data) {
         Intent intent = new Intent(context, ScreenCaptureService.class);
         intent.putExtra(ACTION, START);
@@ -143,77 +166,116 @@ public class ScreenCaptureService extends Service {
         return DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY | DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC;
     }
 
+    private void processImageAsync(final Image image) {
+        try {
+            // Copy image data to our reusable buffer
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer buffer = planes[0].getBuffer();
+            int pixelStride = planes[0].getPixelStride();
+            int rowStride = planes[0].getRowStride();
+            int remaining = buffer.remaining();
+            if (remaining <= mReusableBuffer.capacity()) {
+                mReusableBuffer.clear();
+                mReusableBuffer.put(buffer);
+                mReusableBuffer.flip();
+                byte[] data = new byte[remaining];
+                mReusableBuffer.get(data);
+    
+                // Submit task to executor
+                mExecutor.execute(new ImageProcessingTask(data, stopFan, pixelStride, rowStride));
+            } else {
+                Log.e(TAG, "Buffer overflow: " + remaining + " > " + mReusableBuffer.capacity());
+            }
+        } finally {
+            image.close(); // Release the image immediately
+        }
+    }
+
+    private class ImageProcessingTask implements Runnable {
+        private final byte[] mImageData;
+        private final boolean mStopFan;
+        private final int pixelStride;
+        private final int rowStride;
+
+    ImageProcessingTask(byte[] data, boolean stopFan, int pixelStride, int rowStride) {
+        mImageData = data;
+        mStopFan = stopFan; 
+        this.pixelStride = pixelStride;
+        this.rowStride = rowStride;
+    }
+        @Override
+        public void run() {
+            Bitmap  bitmap = null;
+            long startTime = System.nanoTime();
+            long duration = (endTime - startTime) / 1000000;
+            Log.d("Timing", "Last image in" + duration + " ms");
+            
+            
+            int rowPadding = this.rowStride - this.pixelStride * mWidth;
+            bitmap = Bitmap.createBitmap(mWidth + rowPadding / this.pixelStride, mHeight, Bitmap.Config.ARGB_8888);
+            ByteBuffer buffer = ByteBuffer.wrap(mImageData);
+            bitmap.copyPixelsFromBuffer(buffer);
+            ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, byteArrayOutputStream);
+            byte[] byteArray = byteArrayOutputStream.toByteArray();
+            bitmap.recycle();
+            try {
+                byteArrayOutputStream.close();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            endTime = System.nanoTime();
+            duration = (endTime - startTime) / 1000000;  // Convert to milliseconds
+            Log.d("Timing", "Got image in" + duration + " ms");
+            poseImagesToSend.add(byteArray);
+            endTime = System.nanoTime();
+            duration = (endTime - startTime) / 1000000;  // Convert to milliseconds
+            Log.d("Timing", "stored image in" + duration + " ms");
+            IMAGES_PRODUCED++;
+            long time = System.currentTimeMillis()-startFan;
+            
+            Log.i("fan data", " Image number " + IMAGES_PRODUCED + " at " + time + "with orientation " + orientation);
+            timeList.add(time);
+            if(stopFan){
+                try {
+                    fanFlag = false;
+                    JSONObject dataToSend = new JSONObject();
+                    dataToSend.put("startFan", startFan);
+                    dataToSend.put("imageType","voxel");
+                    dataToSend.put("target", bodyPart);
+                    dataToSend.put("pt_number", pt_number);
+                    dataToSend.put("orientation", orientation);
+                    dataToSend.put("timeList", timeList.toString());
+                    Log.e("to send", "data to send = " + dataToSend);
+                    message = socketThread.sendList((List<byte[]>) poseImagesToSend, dataToSend);
+                    setMessage(message);
+                    poseImagesToSend.clear();
+                    IMAGES_PRODUCED=0;
+                    if (orientation == "transverse"){
+                        orientation = "sagittal";
+                        
+                    }
+                }catch (Exception e){
+                    Log.e("return","Exceptiong = " + e);
+                }
+            }
+        } 
+    }
     private class ImageAvailableListener implements ImageReader.OnImageAvailableListener {
         @Override
         public void onImageAvailable(ImageReader reader) {
-            FileOutputStream fos = null;
-            Bitmap bitmap = null;
-            try (Image image = mImageReader.acquireLatestImage()) {
-                if (image != null) {
-                    Image.Plane[] planes = image.getPlanes();
-                    ByteBuffer buffer = planes[0].getBuffer();
-                    int pixelStride = planes[0].getPixelStride();
-                    int rowStride = planes[0].getRowStride();
-                    int rowPadding = rowStride - pixelStride * mWidth;
-                    bitmap = Bitmap.createBitmap(mWidth + rowPadding / pixelStride, mHeight, Bitmap.Config.ARGB_8888);
-                    bitmap.copyPixelsFromBuffer(buffer);
-                    ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 100, byteArrayOutputStream);
-                    byte[] byteArray = byteArrayOutputStream.toByteArray();
-                    bitmap.recycle();
+            //long startImageAvailable = System.nanoTime();
+            //long duration = (acquriedImage - startImageAvailable) / 1000000;
+            //Log.d("Timing", "Acquired  image in" + duration + " ms");
+            Image image = mImageReader.acquireLatestImage();
+            //acquriedImage = System.nanoTime();
+            if (fanFlag && image!=null){
+                processImageAsync(image);
 
-                   
-                    if(fanFlag){
-                        poseImagesToSend.add(byteArray);
-                        IMAGES_PRODUCED++;
-                        long time = System.currentTimeMillis()-startFan;
-                        JSONObject dataToSend = new JSONObject();
-                        dataToSend.put("startFan", startFan);
-                        dataToSend.put("imageType","voxel");
-                        dataToSend.put("target", bodyPart);
-                        dataToSend.put("pt_number", pt_number);
-                        dataToSend.put("orientation", orientation);
-
-                        Log.i("fan data", " Image number " + IMAGES_PRODUCED + " at " + time + "with orientation " + orientation);
-                        timeList.add(time);
-                        if(stopFan){
-                            try {
-                                fanFlag = false;
-                                dataToSend.put("timeList", timeList.toString());
-                                Log.e("to send", "data to send = " + dataToSend);
-                                socketThread.sendList((List<byte[]>) poseImagesToSend, dataToSend);
-                                poseImagesToSend.clear();
-                                IMAGES_PRODUCED=0;
-                                if (orientation == "transverse"){
-                                    orientation = "sagittal";
-                                    ((TextView) UIView.findViewById(R.id.textView)).setText("Sagittal");
-                                }
-                            }catch (Exception e){
-                                Log.e("return","Exceptiong = " + e);
-                            }
-                        }
-
-                    }
-
-
-                }
-
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                if (fos != null) {
-                    try {
-                        fos.close();
-                    } catch (IOException ioe) {
-                        ioe.printStackTrace();
-                    }
-                }
-
-                if (bitmap != null) {
-                    bitmap.recycle();
-                }
-
+            } else if (image != null) {
+                image.close();
             }
+
         }
     }
 
@@ -282,8 +344,8 @@ public class ScreenCaptureService extends Service {
                 LayoutParamFlags,
                 PixelFormat.TRANSPARENT);
         params.gravity = Gravity.BOTTOM | Gravity.LEFT;
-        params.x = 1000;
-        params.y = 1000;
+        params.x = 5;
+        params.y = 5;
         windowManager = (WindowManager) this.getSystemService(WINDOW_SERVICE);
         appParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -319,14 +381,16 @@ public class ScreenCaptureService extends Service {
             Notification.Builder builder = new Notification.Builder(this, CHANNEL_ID);
             builder.setContentTitle(getString(R.string.overlay)).setContentText(getString(R.string.overlay_notification)).setSmallIcon(R.drawable.ic_launcher_background);
             startForeground(1, builder.build());
-            params.x = 500;
-            params.y = 500;
+            params.x = 5;
+            params.y = 5;
             windowManager.updateViewLayout(layoutView, params);
         }
 
         //For screen grab
         socketThread = new SocketThread();
         socketThread.start();
+
+     
 
 
         // create store dir
@@ -425,11 +489,11 @@ public class ScreenCaptureService extends Service {
     @SuppressLint("WrongConstant")
     private void createVirtualDisplay() {
         // get width and height
-        mWidth = Resources.getSystem().getDisplayMetrics().widthPixels;
-        mHeight = Resources.getSystem().getDisplayMetrics().heightPixels;
+        mWidth = Resources.getSystem().getDisplayMetrics().widthPixels/2;
+        mHeight = Resources.getSystem().getDisplayMetrics().heightPixels/2;
 
         // start capture reader
-        mImageReader = ImageReader.newInstance(mWidth, mHeight, PixelFormat.RGBA_8888, 2);
+        mImageReader = ImageReader.newInstance(mWidth, mHeight, PixelFormat.RGBA_8888, 20);
         mVirtualDisplay = mMediaProjection.createVirtualDisplay(SCREENCAP_NAME, mWidth, mHeight,
                 mDensity, getVirtualDisplayFlags(), mImageReader.getSurface(), null, mHandler);
         mImageReader.setOnImageAvailableListener(new ImageAvailableListener(), mHandler);
@@ -442,18 +506,33 @@ public class ScreenCaptureService extends Service {
     }
     public void StartFan(View view) {
         ((TextView) UIView.findViewById(R.id.textView)).setText("Fan Through");
+        stopFan = false;
         fanFlag = true;
         startFan = System.currentTimeMillis();
+
     }
 
     public void StopFan(View view){
         stopFan = true;
+        ((TextView) UIView.findViewById(R.id.textView)).setText("Sending data");
         if (orientation == "sagittal"){
-            
-            Intent returnIntent = new Intent(this, MainActivity.class);
-            startActivity(returnIntent);
-            stopProjection();
+            ((TextView) UIView.findViewById(R.id.textView)).setText("All Done, sending data");
+
+        }else if(message=="All data has been sent"){
+            ((TextView) UIView.findViewById(R.id.textView)).setText("Sagittal");
         }
+    }
+
+    private void updateUIText(final String message) {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                TextView textView = UIView.findViewById(R.id.textView);
+                if (textView != null) {
+                    textView.setText(message);
+                }
+            }
+        });
     }
 }
 
@@ -469,12 +548,18 @@ class SocketThread extends Thread {
     private boolean running = false;
     private int target = 1;
     public int subBodyPart = 2;
+
     @Override
     public void run() {
         super.run();
-        //Log.e("socketthread","the thread has started");
+        URL url = null;
         try {
-            URL url = new URL("http://www.carriertech.uk");
+            url = new URL("http://www.carriertech.uk");
+        } catch (MalformedURLException e) {
+            throw new RuntimeException(e);
+        }
+        try {
+            
             InetAddress serverAddr = InetAddress.getByName(url.getHost());
             socket = new Socket(serverAddr, SERVER_PORT);
             //Log.e("socketthread","the socket is = " + socket);
@@ -512,13 +597,21 @@ class SocketThread extends Thread {
         return mServerMessage;
     }
 
-    public void sendList(List<byte[]> poseImagesToSend, JSONObject poseJSONsToSend) throws IOException {
+    public String sendList(List<byte[]> poseImagesToSend, JSONObject poseJSONsToSend) throws IOException {
+        String message = "";
+        Socket socket = null;
+        DataOutputStream dos = null;
+        DataInputStream dis = null;
+        BufferedReader mBufferIn = null;
+        URL url = new URL("http://www.carriertech.uk");
         try {
-            Log.e("return", "made it to socket");
-
+            InetAddress serverAddr = InetAddress.getByName(url.getHost());
+            socket = new Socket(serverAddr, SERVER_PORT);
+            //Log.e("socketthread","the socket is = " + socket);
+            mBufferIn = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             String mServerMessage = "";
-            DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
-            DataInputStream dis = new DataInputStream(socket.getInputStream());
+            dos = new DataOutputStream(socket.getOutputStream());
+            dis = new DataInputStream(socket.getInputStream());
             byte[] messageByte = new byte[10];
             int c = 0;
             for (byte[] image : poseImagesToSend) {
@@ -527,31 +620,25 @@ class SocketThread extends Thread {
                 dos.writeChars("ENDOFIMAGE");
                 Log.i("socket", "sent image " + c);
             }
-            Log.i("socket", "finished sending images");
             String DTS = poseJSONsToSend.toString();
-            Log.i("socket", "to string = " + DTS);
             dos.writeUTF(DTS);
-            Log.i("socket", "sent DTS");
             dos.writeChars("ENDOFFILE");
-            Log.e("return", "sent");
+            message = "All data has been sent";
         }catch (IOException e) {
             Log.e("return", String.valueOf(e));
             e.printStackTrace();
-        }
-        /*for (int i = 0; i < poseImagesToSend.size(); i++) {
-            Log.e("return","sendingfile numer " + i);
+            message = "There was an error sending the data";
+        }finally {
+            // Close everything in the finally block
             try {
-                dos.write(poseImagesToSend.get(i));
-                dos.writeChars("ENDOFIMAGE");
-                String msg = poseJSONsToSend.get(i).toString();
-                dos.writeUTF(msg);
-                dos.writeChars("ENDOFFILE");
-                int bytesRead = dis.read(messageByte);
-                mServerMessage+= new String(messageByte, 0, bytesRead);
+                if (dos != null) dos.close();
+                if (dis != null) dis.close();
+                if (mBufferIn != null) mBufferIn.close();
+                if (socket != null) socket.close();
             } catch (IOException e) {
-                Log.e("return", String.valueOf(e));
-                e.printStackTrace();
+                Log.e("return", "Error closing resources: " + e.getMessage());
             }
-        }*/
+        }
+        return message;
     }
 }
