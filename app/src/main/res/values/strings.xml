@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">PhysioAndroid</string>
+    <string name="start_recording">start_recording</string>
+    <string name="stop_recording">stop_recording</string>
+    <string name="recording" />
+    <string name="Shoulder">Shoulder</string>
+    <string name="Abdomen">Abdomen</string>
+    <string name="overlay_notification">Overlay On</string>
+    <string name="overlay">Overlay</string>
+    <string name="close_app">Close</string>
+    <string name="nav_open">Open Navigation Drawer</string>
+    <string name="nav_close">Close Navigation Drawer</string>
+</resources>
