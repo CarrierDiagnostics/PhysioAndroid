@@ -98,7 +98,7 @@ public class ScreenCaptureService extends Service {
     private int mHeight;
     private int mRotation;
     private OrientationChangeCallback mOrientationChangeCallback;
-    long startFan;
+    static long startFan;
     private boolean stopFan;
 
     static final String CHANNEL_ID = "Overlay_notification_channel";
@@ -508,7 +508,7 @@ public class ScreenCaptureService extends Service {
         ((TextView) UIView.findViewById(R.id.textView)).setText("Fan Through");
         stopFan = false;
         fanFlag = true;
-        startFan = System.currentTimeMillis();
+
 
     }
 

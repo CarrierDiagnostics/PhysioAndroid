@@ -93,6 +93,7 @@ public class MainActivity extends AppCompatActivity {
             public void onClick(View v) {
                 ScreenCaptureService.bodyPart = bodyPart;
                 ScreenCaptureService.orientation = "transverse";
+                ScreenCaptureService.startFan = System.currentTimeMillis();
                 startProjection();
             }
         });
